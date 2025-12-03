@@ -55,6 +55,9 @@ app.post('/api/verify-payment', async (req, res) => {
             customer_details
         } = req.body;
 
+        console.log('Verifying payment:', razorpay_payment_id);
+
+        // 1. VERIFY SIGNATURE
         const body = razorpay_order_id + "|" + razorpay_payment_id;
         const expectedSignature = crypto
             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -62,15 +65,24 @@ app.post('/api/verify-payment', async (req, res) => {
             .digest('hex');
 
         if (expectedSignature !== razorpay_signature) {
+            console.error('Invalid signature');
             return res.status(400).json({ success: false, message: "Invalid Signature" });
         }
 
+        console.log('Signature verified ✓');
+
+        // 2. GET PAYMENT DETAILS FROM RAZORPAY
+        const payment = await razorpay.payments.fetch(razorpay_payment_id);
+        console.log('Payment status:', payment.status);
+
+        // 3. PREPARE LINE ITEMS
         const line_items = cart_data.items.map(item => ({
             variant_id: item.variant_id,
             quantity: item.quantity,
-            price: item.price / 100
+            price: (item.price / 100).toFixed(2)
         }));
 
+        // 4. CREATE SHOPIFY ORDER WITH TRANSACTION
         const shopifyOrderData = {
             order: {
                 line_items: line_items,
@@ -85,25 +97,50 @@ app.post('/api/verify-payment', async (req, res) => {
                     last_name: customer_details.last_name,
                     address1: customer_details.address,
                     city: customer_details.city,
+                    province: customer_details.state,
                     zip: customer_details.zip,
-                    country: "India"
+                    country: customer_details.country || "India",
+                    phone: customer_details.phone
                 },
                 shipping_address: {
                     first_name: customer_details.first_name,
                     last_name: customer_details.last_name,
                     address1: customer_details.address,
                     city: customer_details.city,
+                    province: customer_details.state,
                     zip: customer_details.zip,
-                    country: "India"
+                    country: customer_details.country || "India",
+                    phone: customer_details.phone
                 },
                 financial_status: "paid",
-                tags: "Razorpay, API",
-                note: `Razorpay Payment ID: ${razorpay_payment_id}`
+                email: customer_details.email,
+                send_receipt: true,
+                send_fulfillment_receipt: false,
+                note: customer_details.notes || '',
+                tags: "Razorpay,paid",
+                // CRITICAL: Add transaction to mark as paid
+                transactions: [{
+                    kind: 'sale',
+                    status: 'success',
+                    amount: (payment.amount / 100).toFixed(2),
+                    gateway: 'Razorpay',
+                    authorization: razorpay_payment_id,
+                    currency: 'INR'
+                }],
+                note_attributes: [
+                    { name: 'Payment Gateway', value: 'Razorpay' },
+                    { name: 'Payment ID', value: razorpay_payment_id },
+                    { name: 'Order ID', value: razorpay_order_id },
+                    { name: 'Payment Method', value: payment.method }
+                ]
             }
         };
 
+        console.log('Creating Shopify order...');
+
+        // 5. SEND TO SHOPIFY
         const shopifyResponse = await axios.post(
-            `https://${SHOPIFY_STORE}/admin/api/2023-10/orders.json`,
+            `https://${SHOPIFY_STORE}/admin/api/2024-01/orders.json`,
             shopifyOrderData,
             {
                 headers: {
@@ -113,15 +150,25 @@ app.post('/api/verify-payment', async (req, res) => {
             }
         );
 
+        console.log('Shopify order created:', shopifyResponse.data.order.name);
+
+        // 6. RETURN SUCCESS
         res.json({
             success: true,
+            payment_verified: true,
             shopify_order_id: shopifyResponse.data.order.id,
-            order_name: shopifyResponse.data.order.name
+            order_name: shopifyResponse.data.order.name,
+            order_number: shopifyResponse.data.order.order_number,
+            message: 'Payment verified and order created successfully'
         });
 
     } catch (error) {
-        console.error("Error creating Shopify order:", error.response ? error.response.data : error.message);
-        res.status(500).json({ success: false, error: "Payment verified but Shopify order failed." });
+        console.error("Error:", error.response ? error.response.data : error.message);
+        res.status(500).json({ 
+            success: false, 
+            error: "Payment verified but Shopify order failed.",
+            details: error.response ? error.response.data : error.message
+        });
     }
 });
 
