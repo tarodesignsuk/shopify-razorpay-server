@@ -24,14 +24,45 @@ app.get('/', (req, res) => {
 
 app.post('/api/create-payment', async (req, res) => {
     try {
+        console.log('Create payment request received:', req.body);
+        
         const { amount, currency, customer_details } = req.body;
+        
+        // VALIDATION: Check amount
+        if (!amount || isNaN(amount) || amount <= 0) {
+            console.error('Invalid amount:', amount);
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid amount',
+                details: `Amount received: ${amount}`
+            });
+        }
+        
+        // Convert to paise (smallest currency unit)
+        const amountInPaise = Math.round(amount * 100);
+        
+        // Razorpay requires minimum 100 paise (₹1)
+        if (amountInPaise < 100) {
+            console.error('Amount too small:', amountInPaise);
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Amount must be at least ₹1.00',
+                details: `Amount in paise: ${amountInPaise}`
+            });
+        }
+        
         const options = {
-            amount: amount * 100,
+            amount: amountInPaise,
             currency: currency || "INR",
             receipt: `rcpt_${Date.now()}`,
             payment_capture: 1
         };
+        
+        console.log('Creating Razorpay order with options:', options);
+        
         const order = await razorpay.orders.create(options);
+        
+        console.log('Razorpay order created successfully:', order.id);
         res.json({
             success: true,
             order_id: order.id,
