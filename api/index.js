@@ -23,6 +23,62 @@ app.get('/', (req, res) => {
     res.send('Shopify-Razorpay Middleware is Running');
 });
 
+// ===== STEP 1.1: CREATE CUSTOMER =====
+app.post('/api/create-customer', async (req, res) => {
+    try {
+        console.log('Create customer request:', req.body);
+        
+        const { name, email, contact, notes } = req.body;
+        
+        // Validation
+        if (!name || name.length < 5 || name.length > 50) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Name must be between 5-50 characters' 
+            });
+        }
+        
+        if (!contact || contact.length < 8) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Contact must be at least 8 digits including country code' 
+            });
+        }
+        
+        if (!email || !email.includes('@')) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Valid email required' 
+            });
+        }
+        
+        // Create customer in Razorpay
+        const customer = await razorpay.customers.create({
+            name: name,
+            email: email,
+            contact: contact,
+            fail_existing: "0", // Return existing customer if duplicate
+            notes: notes || {}
+        });
+
+        console.log('Customer created:', customer.id);
+
+        res.json({
+            success: true,
+            customer_id: customer.id,
+            customer: customer
+        });
+        
+    } catch (error) {
+        console.error("Customer creation error:", error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message,
+            details: error.toString()
+        });
+    }
+});
+
 app.post('/api/create-payment', async (req, res) => {
     try {
         const { amount, currency, customer_details } = req.body;
