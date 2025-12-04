@@ -20,7 +20,7 @@ const SHOPIFY_STORE = rawStore.replace(/^https?:\/\//, '').replace(/\/$/, '');
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
 app.get('/', (req, res) => {
-    res.send('Shopify-Razorpay Middleware is Running');
+    res.send('Shopify-Razorpay Middleware is Running - Import Flow Edition');
 });
 
 // ===== STEP 1.1: CREATE CUSTOMER =====
@@ -79,34 +79,127 @@ app.post('/api/create-customer', async (req, res) => {
     }
 });
 
+// ===== STEP 1.2: CREATE ORDER (IMPORT FLOW) =====
 app.post('/api/create-payment', async (req, res) => {
     try {
-        const { amount, currency, customer_details } = req.body;
+        console.log('Create order request:', req.body);
+        
+        const { 
+            amount, 
+            currency, 
+            customer_id,
+            customer_details,
+            notes 
+        } = req.body;
+        
+        // Validation
+        if (!customer_id) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'customer_id is required. Create customer first using /api/create-customer' 
+            });
+        }
+        
+        if (!amount || amount < 1) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Amount must be at least ₹1.00' 
+            });
+        }
+        
+        if (!customer_details || !customer_details.name || !customer_details.email || !customer_details.contact) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'customer_details with name, email, and contact are required' 
+            });
+        }
+        
+        // Validate name (English letters only, 5-50 chars)
+        const nameRegex = /^[A-Za-z\s]{5,50}$/;
+        if (!nameRegex.test(customer_details.name)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Customer name must be 5-50 English letters only (no numbers/special chars)' 
+            });
+        }
+        
+        // Validate shipping address if provided
+        if (customer_details.shipping_address) {
+            const addr = customer_details.shipping_address;
+            
+            // Validate city and state (English letters only)
+            const textRegex = /^[A-Za-z\s]+$/;
+            if (addr.city && !textRegex.test(addr.city)) {
+                return res.status(400).json({ 
+                    success: false, 
+                    error: 'City must contain English letters only' 
+                });
+            }
+            if (addr.state && !textRegex.test(addr.state)) {
+                return res.status(400).json({ 
+                    success: false, 
+                    error: 'State must contain English letters only' 
+                });
+            }
+            
+            // Validate address lines (alphanumeric + limited special chars)
+            const addressRegex = /^[A-Za-z0-9\s\*&\/\-\(\)#_+\[\]:'".,]+$/;
+            if (addr.line1 && !addressRegex.test(addr.line1)) {
+                return res.status(400).json({ 
+                    success: false, 
+                    error: 'Address line1 contains invalid characters' 
+                });
+            }
+            if (addr.line2 && !addressRegex.test(addr.line2)) {
+                return res.status(400).json({ 
+                    success: false, 
+                    error: 'Address line2 contains invalid characters' 
+                });
+            }
+        }
         
         // Convert to paise
         const amountInPaise = Math.round(amount * 100);
         
-        const options = {
+        // Create order with Import Flow structure
+        const orderOptions = {
             amount: amountInPaise,
             currency: currency || "INR",
             receipt: `rcpt_${Date.now()}`,
-            payment_capture: 1
+            customer_id: customer_id,
+            customer_details: customer_details,
+            notes: notes || {
+                source: "Shopify Import Flow"
+            }
         };
         
-        const order = await razorpay.orders.create(options);
+        console.log('Creating order with options:', JSON.stringify(orderOptions, null, 2));
         
+        const order = await razorpay.orders.create(orderOptions);
+        
+        console.log('Order created successfully:', order.id);
+
         res.json({
             success: true,
             order_id: order.id,
             amount: order.amount,
-            key_id: process.env.RAZORPAY_KEY_ID
+            currency: order.currency,
+            key_id: process.env.RAZORPAY_KEY_ID,
+            order: order
         });
+        
     } catch (error) {
-        console.error("Error creating Razorpay order:", error);
-        res.status(500).json({ success: false, error: error.message });
+        console.error("Order creation error:", error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message,
+            details: error.toString(),
+            description: error.error?.description || 'Unknown error'
+        });
     }
 });
 
+// ===== VERIFY PAYMENT =====
 app.post('/api/verify-payment', async (req, res) => {
     try {
         const {
