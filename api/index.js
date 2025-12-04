@@ -199,7 +199,7 @@ app.post('/api/create-payment', async (req, res) => {
     }
 });
 
-// ===== VERIFY PAYMENT =====
+// ===== STEP 1.6 & 1.7: VERIFY PAYMENT (ENHANCED FOR IMPORT FLOW) =====
 app.post('/api/verify-payment', async (req, res) => {
     try {
         const {
@@ -210,7 +210,11 @@ app.post('/api/verify-payment', async (req, res) => {
             customer_details
         } = req.body;
 
-        // 1. VERIFY SIGNATURE
+        console.log('=== PAYMENT VERIFICATION START ===');
+        console.log('Order ID:', razorpay_order_id);
+        console.log('Payment ID:', razorpay_payment_id);
+
+        // STEP 1.6: VERIFY SIGNATURE (HMAC SHA256)
         const body = razorpay_order_id + "|" + razorpay_payment_id;
         const expectedSignature = crypto
             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -218,24 +222,68 @@ app.post('/api/verify-payment', async (req, res) => {
             .digest('hex');
 
         if (expectedSignature !== razorpay_signature) {
-            return res.status(400).json({ success: false, message: "Invalid Signature" });
+            console.error('❌ Signature verification failed');
+            return res.status(400).json({ 
+                success: false, 
+                message: "Invalid payment signature. Possible tampering detected." 
+            });
         }
 
-        // 2. GET PAYMENT DETAILS
-        const payment = await razorpay.payments.fetch(razorpay_payment_id);
+        console.log('✅ Signature verified');
 
-        // 3. PREPARE LINE ITEMS
+        // STEP 1.7: VERIFY PAYMENT STATUS WITH RAZORPAY API
+        const payment = await razorpay.payments.fetch(razorpay_payment_id);
+        
+        console.log('Payment Status:', payment.status);
+        console.log('Payment Method:', payment.method);
+        console.log('Payment Amount:', payment.amount / 100, 'INR');
+        console.log('Payment Email:', payment.email);
+        console.log('Payment Contact:', payment.contact);
+        
+        // Verify payment is captured
+        if (payment.status !== 'captured') {
+            console.error('❌ Payment not captured. Status:', payment.status);
+            return res.status(400).json({ 
+                success: false, 
+                message: `Payment not captured. Current status: ${payment.status}` 
+            });
+        }
+        
+        // Verify order details match
+        const orderDetails = await razorpay.orders.fetch(razorpay_order_id);
+        
+        if (payment.amount !== orderDetails.amount) {
+            console.error('❌ Amount mismatch');
+            console.error('Payment amount:', payment.amount);
+            console.error('Order amount:', orderDetails.amount);
+            return res.status(400).json({ 
+                success: false, 
+                message: "Payment amount does not match order amount" 
+            });
+        }
+        
+        console.log('✅ Payment verification complete');
+        console.log('Order details:', {
+            order_id: orderDetails.id,
+            amount: orderDetails.amount / 100,
+            currency: orderDetails.currency,
+            status: orderDetails.status,
+            customer_id: orderDetails.customer_id
+        });
+
+        // PREPARE LINE ITEMS FOR SHOPIFY
         const line_items = cart_data.items.map(item => ({
             variant_id: item.variant_id,
             quantity: item.quantity,
             price: (item.final_price ? item.final_price / 100 : item.price / 100).toFixed(2) 
         }));
 
-        // 4. CREATE SHOPIFY ORDER
+        // CREATE SHOPIFY ORDER
+        console.log('Creating Shopify order...');
+        
         const shopifyOrderData = {
             order: {
                 line_items: line_items,
-                // Customer identification (Email only to prevent phone conflicts)
                 customer: {
                     first_name: customer_details.first_name,
                     last_name: customer_details.last_name,
@@ -264,14 +312,15 @@ app.post('/api/verify-payment', async (req, res) => {
                 email: customer_details.email,
                 inventory_behaviour: "bypass",
                 financial_status: "paid",
-                tags: "Razorpay, API",
+                tags: "Razorpay, Import Flow, API",
+                note: `Razorpay Payment ID: ${razorpay_payment_id}\nRazorpay Order ID: ${razorpay_order_id}\nPayment Method: ${payment.method}`,
                 transactions: [{
                     kind: 'sale',
                     status: 'success',
                     amount: (payment.amount / 100).toFixed(2),
                     gateway: 'Razorpay',
                     authorization: razorpay_payment_id,
-                    currency: 'INR'
+                    currency: payment.currency
                 }]
             }
         };
@@ -287,21 +336,34 @@ app.post('/api/verify-payment', async (req, res) => {
             }
         );
 
-        // 5. SUCCESS! Send back the official Order Status URL
+        console.log('✅ Shopify order created:', shopifyResponse.data.order.id);
+        console.log('=== PAYMENT VERIFICATION COMPLETE ===');
+
+        // SUCCESS RESPONSE
         res.json({
             success: true,
             shopify_order_id: shopifyResponse.data.order.id,
-            // THIS IS THE KEY FIELD FOR THANK YOU PAGE
             order_status_url: shopifyResponse.data.order.order_status_url,
-            order_name: shopifyResponse.data.order.name
+            order_name: shopifyResponse.data.order.name,
+            payment_details: {
+                payment_id: razorpay_payment_id,
+                order_id: razorpay_order_id,
+                method: payment.method,
+                amount: payment.amount / 100,
+                currency: payment.currency,
+                status: payment.status
+            }
         });
 
     } catch (error) {
         const errorDetails = error.response ? JSON.stringify(error.response.data) : error.message;
-        console.error("SHOPIFY ORDER FAILED. Details:", errorDetails);
+        console.error("❌ PAYMENT VERIFICATION FAILED");
+        console.error("Error details:", errorDetails);
+        console.error('=== PAYMENT VERIFICATION FAILED ===');
+        
         res.status(500).json({ 
             success: false, 
-            error: "Order creation failed",
+            error: "Payment verification or order creation failed",
             details: errorDetails
         });
     }
