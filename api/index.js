@@ -40,6 +40,15 @@ app.post('/api/create-customer', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Indian phone number (+91) required' });
         }
         
+        // ✅ ADD STRICT VALIDATION
+        const phoneRegex = /^\+91[6-9]\d{9}$/;
+        if (!phoneRegex.test(contact)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid phone format. Required: +91 followed by 10 digits (first digit 6-9)' 
+            });
+        }
+        
         const customer = await razorpay.customers.create({
             name, email, contact,
             fail_existing: "0",
@@ -63,6 +72,17 @@ app.post('/api/create-payment', async (req, res) => {
         
         if (customer_details?.contact && !customer_details.contact.startsWith('+91')) {
             return res.status(400).json({ success: false, error: 'Indian phone number (+91) required' });
+        }
+        
+        // ✅ ADD STRICT VALIDATION
+        if (customer_details?.contact) {
+            const phoneRegex = /^\+91[6-9]\d{9}$/;
+            if (!phoneRegex.test(customer_details.contact)) {
+                return res.status(400).json({ 
+                    success: false, 
+                    error: 'Invalid phone format. Required: +91XXXXXXXXXX (10 digits, first digit 6-9)' 
+                });
+            }
         }
         
         const order = await razorpay.orders.create({
