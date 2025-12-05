@@ -1,246 +1,182 @@
-async function proceedToPayment() {
-  if(isMockMode) return alert("Preview Mode: Payment Simulation");
-  
-  const btn = document.getElementById('continue-btn');
-  btn.innerHTML = '<span class="spinner"></span> Validating...';
-  btn.disabled = true;
+const express = require('express');
+const cors = require('cors');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
+const axios = require('axios');
 
-  try {
-    const customerDetails = getCustomerDetails();
-    
-    // Calculate final amount with discount
-    let amount = cartData.total_price / 100;
-    if (appliedDiscount) {
-      amount = amount - (amount * (appliedDiscount.value / 100));
-    }
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-    // ===== FRONTEND VALIDATION =====
-    
-    // Validation: Name must be 5-50 English letters only
-    const fullName = customerDetails.first_name + ' ' + customerDetails.last_name;
-    if (!/^[A-Za-z\s]{5,50}$/.test(fullName)) {
-      throw new Error('Name must be 5-50 English letters only (no numbers or special characters)');
-    }
+const razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET
+});
 
-    // Validation: Phone must be Indian number (+91)
-    let phone = customerDetails.phone.trim();
-    
-    // Add +91 if not present
-    if (!phone.startsWith('+')) {
-      if (phone.startsWith('91')) {
-        phone = '+' + phone;
-      } else {
-        phone = '+91' + phone;
-      }
-    }
-    
-    // Check if it's an Indian number
-    if (!phone.startsWith('+91')) {
-      throw new Error('⚠️ Razorpay Import Flow requires Indian phone numbers.\n\nPlease use an Indian mobile number starting with +91.\n\nExample: +91 9876543210');
-    }
-    
-    // Validate Indian phone format
-    if (!/^\+91[6-9]\d{9}$/.test(phone)) {
-      throw new Error('Invalid Indian phone number format.\n\nRequired: +91 followed by 10 digits starting with 6, 7, 8, or 9.\n\nExample: +91 9876543210');
-    }
-    
-    // Update phone in customerDetails
-    customerDetails.phone = phone;
+const SHOPIFY_STORE = (process.env.SHOPIFY_STORE || "").replace(/^https?:\/\//, '').replace(/\/$/, '');
+const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
-    // Validation: City and State must be English letters only
-    if (!/^[A-Za-z\s]+$/.test(customerDetails.city)) {
-      throw new Error('City must contain English letters only');
-    }
-    if (!/^[A-Za-z\s]+$/.test(customerDetails.state)) {
-      throw new Error('State must contain English letters only');
-    }
+app.get('/', (req, res) => {
+    res.send('Shopify-Razorpay Server v2.0 - Running');
+});
 
-    // Validation: Address (alphanumeric + limited special chars)
-    if (!/^[A-Za-z0-9\s\*&\/\-\(\)#_+\[\]:'".,]+$/.test(customerDetails.address)) {
-      throw new Error('Address contains invalid characters');
-    }
-
-    // STEP 1.1: CREATE CUSTOMER
-    btn.innerHTML = '<span class="spinner"></span> Creating customer...';
-    console.log('Step 1.1: Creating customer...');
-    console.log('Phone number:', phone);
-    
-    const customerResponse = await fetch(`${API_URL}/api/create-customer`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: fullName,
-        email: customerDetails.email,
-        contact: phone,
-        notes: {
-          source: "Shopify Checkout",
-          discount_code: appliedDiscount ? Object.keys(validCodes).find(k => validCodes[k] === appliedDiscount) : 'none'
-        }
-      })
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        version: '2.0',
+        timestamp: new Date().toISOString()
     });
+});
 
-    const customerData = await customerResponse.json();
-    
-    if (!customerData.success) {
-      throw new Error(customerData.error || 'Customer creation failed');
+app.post('/api/create-customer', async (req, res) => {
+    try {
+        const { name, email, contact, notes } = req.body;
+        
+        if (!name || !email || !contact) {
+            return res.status(400).json({ success: false, error: 'Missing required fields' });
+        }
+        
+        if (!contact.startsWith('+91')) {
+            return res.status(400).json({ success: false, error: 'Indian phone number (+91) required' });
+        }
+        
+        const customer = await razorpay.customers.create({
+            name, email, contact,
+            fail_existing: "0",
+            notes: notes || {}
+        });
+
+        res.json({ success: true, customer_id: customer.id, customer });
+        
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
+});
 
-    console.log('✅ Customer created:', customerData.customer_id);
+app.post('/api/create-payment', async (req, res) => {
+    try {
+        const { amount, currency, customer_id, customer_details, notes } = req.body;
+        
+        if (!customer_id || !amount || amount < 1) {
+            return res.status(400).json({ success: false, error: 'Invalid parameters' });
+        }
+        
+        if (customer_details?.contact && !customer_details.contact.startsWith('+91')) {
+            return res.status(400).json({ success: false, error: 'Indian phone number (+91) required' });
+        }
+        
+        const order = await razorpay.orders.create({
+            amount: Math.round(amount * 100),
+            currency: currency || "INR",
+            receipt: `rcpt_${Date.now()}`,
+            customer_id,
+            customer_details,
+            notes: notes || {}
+        });
 
-    // STEP 1.1.5: FETCH HS CODES FOR ALL ITEMS
-    btn.innerHTML = '<span class="spinner"></span> Preparing items...';
-    console.log('Step 1.1.5: Fetching HS codes for cart items...');
-    
-    const itemsWithHSCodes = await Promise.all(
-      cartData.items.map(async (item) => {
-        const hsCode = await getHSCodeAsync(item);
-        return {
-          ...item,
-          fetched_hs_code: hsCode
-        };
-      })
-    );
-    
-    console.log('✅ HS Codes fetched for all items');
+        res.json({
+            success: true,
+            order_id: order.id,
+            amount: order.amount,
+            currency: order.currency,
+            key_id: process.env.RAZORPAY_KEY_ID
+        });
+        
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 
-    // STEP 1.2: CREATE ORDER WITH CUSTOMER_ID
-    btn.innerHTML = '<span class="spinner"></span> Creating order...';
-    console.log('Step 1.2: Creating order...');
+app.post('/api/verify-payment', async (req, res) => {
+    try {
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, cart_data, customer_details } = req.body;
 
-    const orderResponse = await fetch(`${API_URL}/api/create-payment`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        amount: amount,
-        currency: "INR",
-        customer_id: customerData.customer_id,
-        customer_details: {
-          name: fullName,
-          email: customerDetails.email,
-          contact: phone,
-          shipping_address: {
-            line1: customerDetails.address,
-            line2: "",
-            city: customerDetails.city,
-            state: customerDetails.state,
-            country: "IND",
-            zipcode: customerDetails.zip
-          }
-        },
-        notes: {
-          source: "Shopify Import Flow",
-          cart_token: cartData.token || "manual",
-          discount_applied: appliedDiscount ? Object.keys(validCodes).find(k => validCodes[k] === appliedDiscount) : 'none',
-          original_amount: (cartData.total_price / 100).toFixed(2),
-          final_amount: amount.toFixed(2),
-          product_category: "Women's & Girls' Apparel",
-          items_details: itemsWithHSCodes.map(item => ({
-            name: item.product_title,
+        const body = razorpay_order_id + "|" + razorpay_payment_id;
+        const expectedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+            .update(body.toString()).digest('hex');
+
+        if (expectedSignature !== razorpay_signature) {
+            return res.status(400).json({ success: false, message: "Invalid signature" });
+        }
+
+        const payment = await razorpay.payments.fetch(razorpay_payment_id);
+        
+        if (payment.status !== 'captured') {
+            return res.status(400).json({ success: false, message: "Payment not captured" });
+        }
+
+        const line_items = cart_data.items.map(item => ({
+            variant_id: item.variant_id,
             quantity: item.quantity,
-            hs_code: item.fetched_hs_code,
-            material: getMaterialDescription(item.product_title),
-            category: getProductCategory(item.product_title),
-            variant: item.variant_title || 'Standard',
-            sku: item.sku || '',
-            handle: item.handle || ''
-          }))
-        }
-      })
-    });
+            price: ((item.final_price || item.price) / 100).toFixed(2)
+        }));
 
-    const orderData = await orderResponse.json();
-    
-    if (!orderData.success) {
-      throw new Error(orderData.error || 'Order creation failed');
+        const shopifyOrder = await axios.post(
+            `https://${SHOPIFY_STORE}/admin/api/2023-10/orders.json`,
+            {
+                order: {
+                    line_items,
+                    customer: {
+                        first_name: customer_details.first_name,
+                        last_name: customer_details.last_name,
+                        email: customer_details.email
+                    },
+                    billing_address: {
+                        first_name: customer_details.first_name,
+                        last_name: customer_details.last_name,
+                        address1: customer_details.address,
+                        city: customer_details.city,
+                        province: customer_details.state,
+                        zip: customer_details.zip,
+                        country: "India",
+                        phone: customer_details.phone
+                    },
+                    shipping_address: {
+                        first_name: customer_details.first_name,
+                        last_name: customer_details.last_name,
+                        address1: customer_details.address,
+                        city: customer_details.city,
+                        province: customer_details.state,
+                        zip: customer_details.zip,
+                        country: "India",
+                        phone: customer_details.phone
+                    },
+                    email: customer_details.email,
+                    financial_status: "paid",
+                    tags: "Razorpay, Import Flow, API",
+                    note: `Payment ID: ${razorpay_payment_id}`,
+                    transactions: [{
+                        kind: 'sale',
+                        status: 'success',
+                        amount: (payment.amount / 100).toFixed(2),
+                        gateway: 'Razorpay'
+                    }]
+                }
+            },
+            {
+                headers: {
+                    'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+
+        res.json({
+            success: true,
+            shopify_order_id: shopifyOrder.data.order.id,
+            order_name: shopifyOrder.data.order.name,
+            payment_details: {
+                payment_id: razorpay_payment_id,
+                order_id: razorpay_order_id
+            }
+        });
+
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
+});
 
-    console.log('✅ Order created:', orderData.order_id);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
 
-    // STEP 1.3: OPEN RAZORPAY CHECKOUT
-    btn.innerHTML = '<span class="spinner"></span> Opening payment...';
-    closeModal();
-
-    const rzpOptions = {
-      key: orderData.key_id,
-      amount: orderData.amount,
-      currency: orderData.currency,
-      order_id: orderData.order_id,
-      customer_id: customerData.customer_id,
-      name: "{{ shop.name }}",
-      description: `Order for ${cartData.item_count} item(s)`,
-      image: "{{ shop.logo | img_url: 'medium' }}",
-      prefill: {
-        name: fullName,
-        email: customerDetails.email,
-        contact: phone
-      },
-      theme: {
-        color: "#0080ff"
-      },
-      handler: async function(response) {
-        // STEP 1.4: SUCCESS HANDLER
-        console.log('=== PAYMENT HANDLER TRIGGERED ===');
-        console.log('Payment ID:', response.razorpay_payment_id);
-        console.log('Order ID:', response.razorpay_order_id);
-        console.log('Signature:', response.razorpay_signature);
-        console.log('Payment successful, verifying...');
-        
-        try {
-          await verifyPayment(response, customerDetails);
-        } catch (error) {
-          console.error('❌ VERIFICATION ERROR:', error);
-          alert('Payment successful but verification failed.\n\nPayment ID: ' + response.razorpay_payment_id + '\n\nPlease contact support to complete your order.');
-        }
-      },
-      modal: {
-        ondismiss: function() {
-          // STEP 1.4: CANCEL HANDLER
-          console.log('Payment cancelled by user');
-          btn.innerHTML = 'Pay Now';
-          btn.disabled = false;
-          alert('Payment cancelled. Your cart items are still saved.');
-        }
-      }
-    };
-
-    const rzp = new Razorpay(rzpOptions);
-    
-    // Error handler for Razorpay failures
-    rzp.on('payment.failed', function(response) {
-      console.error('❌ PAYMENT FAILED:', response.error);
-      console.error('Code:', response.error.code);
-      console.error('Description:', response.error.description);
-      console.error('Reason:', response.error.reason);
-      alert(`Payment failed: ${response.error.description || 'Please try again'}`);
-      btn.innerHTML = 'Pay Now';
-      btn.disabled = false;
-    });
-
-    rzp.open();
-    
-    // FALLBACK: Check payment status after 10 seconds
-    setTimeout(async () => {
-      console.log('🔍 Fallback: Checking if payment completed without handler...');
-      
-      try {
-        const currentCart = await fetch('/cart.js').then(r => r.json());
-        
-        if (currentCart.item_count > 0) {
-          console.warn('⚠️ Cart still has items 10 seconds after payment initiated.');
-          console.warn('If you completed payment, please contact support.');
-          console.warn('Order ID:', orderData.order_id);
-        } else {
-          console.log('✅ Cart is empty - payment likely succeeded');
-        }
-      } catch (error) {
-        console.error('Fallback check error:', error);
-      }
-    }, 10000);
-
-  } catch (err) {
-    console.error('❌ Payment initiation error:', err);
-    alert('Error: ' + err.message);
-    btn.innerHTML = 'Pay Now';
-    btn.disabled = false;
-  }
-}
+module.exports = app;
